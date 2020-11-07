@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"os"
+	"runtime"
+	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
-	"github.com/elastic/go-elasticsearch/v8/esapi"
+	"github.com/elastic/go-elasticsearch/v8/esutil"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -31,6 +32,22 @@ func main() {
 		log.Fatalf("error creating es client: %s", err)
 	}
 
+	numWorkers := runtime.NumCPU()
+	flushBytes := 5e+6
+
+	bi, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+		Index:         "twitter",
+		Client:        es,
+		NumWorkers:    numWorkers,
+		FlushBytes:    int(flushBytes),
+		FlushInterval: 30 * time.Second,
+	})
+	defer bi.Close(ctx)
+
+	if err != nil {
+		log.Fatalf("error creating indexer: %s", err)
+	}
+
 	twitterKafkaConsumer := NewKafkaReader(kafkaAdddress, kafkaTopic)
 	defer twitterKafkaConsumer.Close()
 
@@ -39,7 +56,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		err = InsertTweet(ctx, es, string(m.Key), bytes.NewReader(m.Value))
+		err = InsertTweet(ctx, bi, string(m.Key), bytes.NewReader(m.Value))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -48,30 +65,35 @@ func main() {
 
 }
 
-//InsertTweet will insert a tweet into the elastic search index "twitter". This is idempotent as the tweetID is unique.
-func InsertTweet(ctx context.Context, es *elasticsearch.Client, tweetID string, TweetReader io.Reader) error {
-	req := esapi.IndexRequest{
-		Index:      "twitter",
-		DocumentID: tweetID,
-		Body:       TweetReader,
-		Refresh:    "true",
-	}
-
-	res, err := req.Do(context.Background(), es)
+//InsertTweet will insert a tweet into the elastic search bulk index "twitter". This is idempotent as the tweetID is unique.
+func InsertTweet(ctx context.Context, bi esutil.BulkIndexer, tweetID string, tweetReader io.Reader) error {
+	err := bi.Add(
+		ctx,
+		esutil.BulkIndexerItem{
+			Action:     "index",
+			DocumentID: tweetID,
+			Body:       tweetReader,
+			OnFailure: func(c context.Context, item esutil.BulkIndexerItem, resp esutil.BulkIndexerResponseItem, err error) {
+				if err != nil {
+					log.Printf("ERROR: %s", err)
+				} else {
+					log.Printf("ERROR: %s: %s", resp.Error.Type, resp.Error.Reason)
+				}
+			},
+		},
+	)
 	if err != nil {
-		return err
+		log.Fatalf("error with indexer: %s", err)
 	}
-	if res.IsError() {
-		return fmt.Errorf("error indexing tweet, %s/%s", res.Status(), res.String())
-	}
-
 	return nil
 }
 
 // NewKafkaReader returns a new kafka io.Reader that can be used to communicate with a kafka broker.
 func NewKafkaReader(kafkaAddress, topic string) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  []string{kafkaAddress},
+		Brokers: []string{
+			kafkaAddress,
+		},
 		GroupID:  "elastic-search",
 		Topic:    topic,
 		MinBytes: 10e3,
